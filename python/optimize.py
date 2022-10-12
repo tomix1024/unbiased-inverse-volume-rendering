@@ -8,7 +8,7 @@ import mitsuba as mi
 from tqdm import tqdm
 
 from batched import render_batch
-from util import save_params, get_single_medium
+from util import save_params, load_params, get_single_medium
 
 
 def load_scene(scene_config, reference=False, **kwargs):
@@ -166,6 +166,29 @@ def initialize_scene(opt_config, scene_config, scene):
     return params
 
 
+def initialize_scene_from_checkpoint(output_dir, opt_config, scene_config, scene, name_or_it):
+    params = mi.traverse(scene)
+    params.keep(scene_config.param_keys)
+
+    prefix = name_or_it
+    if name_or_it == 'initial':
+        if not opt_config.checkpoint_initial:
+            return
+    elif name_or_it == 'final':
+        if not opt_config.checkpoint_final:
+            return
+    elif isinstance(name_or_it, int):
+        if (name_or_it == 0) or (not opt_config.checkpoint_stride) or (name_or_it % opt_config.checkpoint_stride) != 0:
+            return
+        prefix = f'{name_or_it:08d}'
+    else:
+        raise ValueError('Unsupported: ' + str(name_or_it))
+
+    checkpoint_dir = join(output_dir, 'params')
+    load_params(checkpoint_dir, scene_config, params, prefix)
+    return params
+
+
 def enforce_valid_params(scene_config, opt):
     """Projects parameters back to their legal range."""
     for k, v in opt.items():
@@ -309,7 +332,12 @@ def run_optimization(output_dir, opt_config, scene_config, int_config):
         del first_film
 
     # --- Initialization
-    params = initialize_scene(opt_config, scene_config, scene)
+    if opt_config.init_it is not None:
+        print(f"Initialize scene from checkpoint {opt_config.init_it}.")
+        params = initialize_scene_from_checkpoint(output_dir, opt_config, scene_config, scene, opt_config.init_it)
+    else:
+        params = initialize_scene(opt_config, scene_config, scene)
+
     opt = opt_config.optimizer(params)
     for _, v in params.items():
         dr.enable_grad(v)
@@ -322,7 +350,8 @@ def run_optimization(output_dir, opt_config, scene_config, int_config):
         mi.Bitmap(ref_images[s]).write(fname)
 
     # --- Main optimization loop
-    for it_i in tqdm(range(opt_config.n_iter), desc='Optimization',
+    iterations_range = range(opt_config.init_it+1, opt_config.n_iter) if opt_config.init_it is not None else range(opt_config.n_iter)
+    for it_i in tqdm(iterations_range, desc='Optimization',
                      dynamic_ncols=True):
         seed, _ = mi.sample_tea_32(2 * it_i + 0, opt_config.base_seed)
         seed_grad, _ = mi.sample_tea_32(2 * it_i + 1, opt_config.base_seed)

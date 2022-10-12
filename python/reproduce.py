@@ -54,6 +54,7 @@ def main(opt_config_name=None, integrators=None):
         'render_final': True,
         'preview_spp': 1024,
         'checkpoint_stride': None,
+        'init_it': None,
 
         'upsample': [0.04, 0.16, 0.36, 0.64],
     }

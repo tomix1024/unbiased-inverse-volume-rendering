@@ -31,6 +31,8 @@ class OptimizationConfig():
     checkpoint_final: bool = True
     checkpoint_stride: int = 1000
 
+    init_it: int = None
+
     preview_spp: int = None
     opt_type: Callable = 'adam'
     opt_args: Dict = None

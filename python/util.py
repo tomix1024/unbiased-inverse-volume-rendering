@@ -5,6 +5,8 @@ import os
 import pickle
 
 import mitsuba as mi
+import drjit as dr
+import numpy as np
 
 def pickle_cache(fname, overwrite=False):
     """Cache results of long-running functions."""
@@ -70,6 +72,36 @@ def save_params(output_dir, scene_config, params, name):
         grid = mi.VolumeGrid(value.numpy())
         grid.write(fname)
 
+
+def load_params(input_dir, scene_config, params, name):
+    for key in scene_config.param_keys:
+        if not key.endswith('.data'):
+            # TODO: support saving scalar parameters
+            raise NotImplementedError(f'Checkpointing of parameter {key} with type {type(value)}')
+
+        # Heuristic to get the variable name from a parameter key.
+        var_name = key
+        for suffix in ['.data', '.values', '.value']:
+            if var_name.endswith(suffix):
+                var_name = var_name[:-len(suffix)]
+        var_name = '_'.join(var_name.strip().split('.'))
+
+        fname = os.path.join(input_dir, f'{name}-{var_name}.vol')
+        grid = mi.VolumeGrid(fname)
+
+        shape = dr.shape(params[key])
+
+        # Recreate new tensor from grid
+        if grid.channel_count() == 1:
+            # array interface of VolumeGrid cuts of channel dimension if single channel!
+            # Cannot reshape mi.TensorXf
+            # Need to workaround via numpy...
+            tensor = type(params[key])(np.array(grid)[..., None])
+        else:
+            tensor = type(params[key])(grid)
+        params[key] = tensor
+
+    params.update()
 
 
 def get_single_medium(scene):
