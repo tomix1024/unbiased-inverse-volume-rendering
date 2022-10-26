@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from constants import OUTPUT_DIR
 from opt_config import get_int_config, OptimizationConfig, Schedule
-from optimize import run_optimization
+from optimize import run_optimization, estimate_gradient_variance, visualize_gradient_variance
 from scene_config import get_scene_config
 
 
@@ -262,6 +262,8 @@ def main(opt_config_name=None, integrators=None):
         assert found, f'No configuration using integrator name "{opt_config_name}" found.'
 
     reproduce_optimization_experiments(configs, overwrite=False)
+    #estimate_gradients_experiments(configs)
+    #visualize_gradient_variance_experiments(configs)
 
 
 if __name__ == '__main__':

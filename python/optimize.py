@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import drjit as dr
 import mitsuba as mi
+import numpy as np
 from tqdm import tqdm
 
 from batched import render_batch
@@ -295,6 +296,58 @@ def create_checkpoint(output_dir, opt_config, scene_config, params, name_or_it):
     save_params(checkpoint_dir, scene_config, params, prefix)
 
 
+def store_gradient_stats(output_dir, opt_config, scene_config, params, name_or_it, grad_expected, grad_deviation):
+    prefix = name_or_it
+    if name_or_it == 'initial':
+        if not opt_config.checkpoint_initial:
+            return
+    elif name_or_it == 'final':
+        if not opt_config.checkpoint_final:
+            return
+    elif isinstance(name_or_it, int):
+        if (name_or_it == 0) or (not opt_config.checkpoint_stride) or (name_or_it % opt_config.checkpoint_stride) != 0:
+            return
+        prefix = f'{name_or_it:08d}'
+    else:
+        raise ValueError('Unsupported: ' + str(name_or_it))
+
+    checkpoint_dir = join(output_dir, 'params')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    #save_params(checkpoint_dir, scene_config, params, prefix)
+
+    for key, value in grad_expected.items():
+        if not key.endswith('.data'):
+            # TODO: support saving scalar parameters
+            raise NotImplementedError(f'Checkpointing of parameter {key} with type {type(value)}')
+
+        # Heuristic to get the variable name from a parameter key.
+        for suffix in ['.data', '.values', '.value']:
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+        var_name = '_'.join(key.strip().split('.'))
+
+        fname = os.path.join(checkpoint_dir, f'{prefix}-egrad-{var_name}.vol')
+        grid = mi.VolumeGrid(value.numpy())
+        grid.write(fname)
+
+    for key, value in grad_deviation.items():
+        if not key.endswith('.data'):
+            # TODO: support saving scalar parameters
+            raise NotImplementedError(f'Checkpointing of parameter {key} with type {type(value)}')
+
+        # Heuristic to get the variable name from a parameter key.
+        for suffix in ['.data', '.values', '.value']:
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+        var_name = '_'.join(key.strip().split('.'))
+
+        fname = os.path.join(checkpoint_dir, f'{prefix}-dgrad-{var_name}.vol')
+        grid = mi.VolumeGrid(value.numpy())
+        grid.write(fname)
+
+
+
+
 def run_optimization(output_dir, opt_config, scene_config, int_config):
     import integrators
     print(f'[i] Starting optimization:')
@@ -392,3 +445,246 @@ def run_optimization(output_dir, opt_config, scene_config, int_config):
     print(f'[✔︎] Optimization complete: {opt_config.name}\n')
 
     return scene, params, opt
+
+
+
+
+
+def estimate_gradient_variance(output_dir, opt_config, scene_config, int_config):
+    import integrators
+    print(f'[i] Starting optimization:')
+    print(f'    Scene:      {scene_config.name}')
+    print(f'    Integrator: {int_config.name}')
+    print(f'    Output dir: {output_dir}')
+    print(f'    Opt params:')
+    for f in fields(opt_config):
+        print(f'        {f.name}: {opt_config.__dict__[f.name]}')
+
+
+    batch_size = opt_config.batch_size
+    ref_paths = get_reference_image_paths(scene_config)
+    ref_images = load_reference_images(ref_paths, batchify=(batch_size is not None))
+    scene = load_scene(scene_config, reference=False)
+    integrator = int_config.create(max_depth=scene_config.max_depth)
+    sampler = mi.scalar_rgb.PCG32(initstate=93483)
+
+    n_sensors = len(scene_config.sensors)
+    spp_grad = opt_config.spp
+    spp_primal = spp_grad * opt_config.primal_spp_factor
+
+    if batch_size is not None:
+        sensors_dr = dr.gather(mi.SensorPtr, scene.sensors_dr(),
+                               mi.UInt32(scene_config.sensors))
+        # Assume that all sensors have the same dimensions
+        first_film = scene.sensors()[scene_config.sensors[0]].film()
+        film_size = first_film.crop_size()
+        pixel_format = (
+            mi.Bitmap.PixelFormat.RGBA if mi.has_flag(first_film.flags(), mi.FilmFlags.Alpha)
+            else mi.Bitmap.PixelFormat.RGB
+        )
+        batch_film = None
+        batch_render_sampler = None
+        del first_film
+
+    # --- Initialization
+    if opt_config.init_it is not None:
+        print(f"Initialize scene from checkpoint {opt_config.init_it}.")
+        params = initialize_scene_from_checkpoint(output_dir, opt_config, scene_config, scene, opt_config.init_it)
+    else:
+        params = initialize_scene(opt_config, scene_config, scene)
+
+    accumulators = dict()
+    for k, v in params.items():
+        dr.enable_grad(v)
+        accumulators[k] = [ type(v)(0, shape=v.shape), type(v)(0, shape=v.shape) ]
+
+    # --- Main optimization loop
+    count = 1024
+    for it_i in tqdm(range(count), desc='Gradient Computation',
+                     dynamic_ncols=True):
+        seed, _ = mi.sample_tea_32(2 * it_i + 0, opt_config.base_seed)
+        seed_grad, _ = mi.sample_tea_32(2 * it_i + 1, opt_config.base_seed)
+
+        if batch_size is not None:
+            # --- Batched rendering
+            image, batch_film, batch_render_sampler, sensor_idx, pixel_idx = render_batch(
+                batch_size, scene, sensors_dr, film_size,
+                params=params, integrator=integrator, film=batch_film,
+                pixel_format=pixel_format, sampler=batch_render_sampler,
+                spp=spp_primal, spp_grad=spp_grad,
+                seed=seed, seed_grad=seed_grad
+            )
+            ref_values = gather_ref_values(ref_images, sensor_idx, pixel_idx)
+        else:
+            # --- Sensor-based rendering
+            sensor_i = scene_config.sensors[int(sampler.next_float32() * n_sensors)]
+            image = mi.render(scene, params=params, integrator=integrator, sensor=sensor_i,
+                              spp=spp_primal, spp_grad=spp_grad,
+                              seed=seed, seed_grad=seed_grad)
+            ref_values = ref_images[sensor_i]
+        loss_value = opt_config.loss(image, ref_values)
+        dr.backward(loss_value)
+
+        # --- Accumulate gradient values and squared gradient values somewhere else!
+        for k, v in params:
+            grad_v = dr.grad(v)
+            accs = accumulators[k]
+            accs[0] += grad_v
+            accs[1] += grad_v**2
+            dr.schedule(accs[0])
+            dr.schedule(accs[1])
+
+            # Reset gradient
+            dr.set_grad(v, 0)
+
+    grad_expected = dict()
+    grad_deviation = dict()
+    for k, v in params:
+        accs = accumulators[k]
+
+        expected = accs[0]/count
+        variance = accs[1]/count - (expected)**2
+        deviation = dr.sqrt(variance)
+        dr.schedule(expected)
+        dr.schedule(deviation)
+        grad_expected[k] = expected
+        grad_deviation[k] = deviation
+
+        print(k, dr.sum(deviation))
+
+    store_gradient_stats(output_dir, opt_config, scene_config, params, opt_config.init_it, grad_expected, grad_deviation)
+
+    # ------
+
+    print(f'[✔︎] Optimization complete: {opt_config.name}\n')
+
+    return scene, params
+
+
+
+
+
+
+def visualize_gradient_variance(output_dir, opt_config, scene_config, int_config):
+    import integrators
+    print(f'[i] Starting optimization:')
+    print(f'    Scene:      {scene_config.name}')
+    print(f'    Integrator: {int_config.name}')
+    print(f'    Output dir: {output_dir}')
+    print(f'    Opt params:')
+    for f in fields(opt_config):
+        print(f'        {f.name}: {opt_config.__dict__[f.name]}')
+
+
+    batch_size = opt_config.batch_size
+    ref_paths = get_reference_image_paths(scene_config)
+    ref_images = load_reference_images(ref_paths, batchify=(batch_size is not None))
+    scene = load_scene(scene_config, reference=False)
+    integrator = int_config.create(max_depth=scene_config.max_depth)
+    sampler = mi.scalar_rgb.PCG32(initstate=93483)
+
+    n_sensors = len(scene_config.sensors)
+    spp_grad = opt_config.spp
+    spp_primal = spp_grad * opt_config.primal_spp_factor
+
+    if batch_size is not None:
+        sensors_dr = dr.gather(mi.SensorPtr, scene.sensors_dr(),
+                               mi.UInt32(scene_config.sensors))
+        # Assume that all sensors have the same dimensions
+        first_film = scene.sensors()[scene_config.sensors[0]].film()
+        film_size = first_film.crop_size()
+        pixel_format = (
+            mi.Bitmap.PixelFormat.RGBA if mi.has_flag(first_film.flags(), mi.FilmFlags.Alpha)
+            else mi.Bitmap.PixelFormat.RGB
+        )
+        batch_film = None
+        batch_render_sampler = None
+        del first_film
+
+    # --- Initialization
+    if opt_config.init_it is not None:
+        print(f"Initialize scene from checkpoint {opt_config.init_it}.")
+        params = initialize_scene_from_checkpoint(output_dir, opt_config, scene_config, scene, opt_config.init_it)
+    else:
+        params = initialize_scene(opt_config, scene_config, scene)
+
+    vis_param_key = 'medium1.sigma_t.data'
+
+    checkpoint_dir = join(output_dir, 'params', )
+    fname = join(checkpoint_dir, '00000200-egrad-medium1_sigma_t.vol')
+    grid = mi.VolumeGrid(fname)
+
+    # Recreate new tensor from grid
+    if grid.channel_count() == 1:
+        # array interface of VolumeGrid cuts of channel dimension if single channel!
+        # Cannot reshape mi.TensorXf
+        # Need to workaround via numpy...
+        value = type(params[vis_param_key])(np.array(grid)[..., None])
+    else:
+        value = type(params[vis_param_key])(grid)
+
+    value = dr.clamp(value*100000, -1, 1)
+    print(dr.mean(value))
+
+    np_value = value.numpy()
+    np_red = np.array([1, 0, 0])
+    np_blue = np.array([0, 0, 1])
+    np_color = np.where(np_value > 0, np_red, np_blue)
+    color = mi.TensorXf(np_color)
+
+    params['medium1.emission.data'] = type(params['medium1.emission.data'])(0, shape=params['medium1.emission.data'].shape)
+    params['medium1.sigma_t.data'] = type(params['medium1.sigma_t.data'])(dr.abs(value))
+    params['medium1.albedo.data'] = type(params['medium1.albedo.data'])(color)
+    params.update()
+
+    preview_spp = opt_config.preview_spp or opt_config.spp
+
+    for s in scene_config.preview_sensors:
+        fname = join(output_dir, f'egrad.exr')
+        image = mi.render(scene, integrator=integrator, sensor=s,
+                          seed=1234, spp=preview_spp,)
+        mi.Bitmap(image).write(fname)
+
+
+    fname = join(checkpoint_dir, '00000200-dgrad-medium1_sigma_t.vol')
+    grid = mi.VolumeGrid(fname)
+
+    # Recreate new tensor from grid
+    if grid.channel_count() == 1:
+        # array interface of VolumeGrid cuts of channel dimension if single channel!
+        # Cannot reshape mi.TensorXf
+        # Need to workaround via numpy...
+        value = type(params[vis_param_key])(np.array(grid)[..., None])
+    else:
+        value = type(params[vis_param_key])(grid)
+
+    value = dr.clamp(value*10000, -1, 1)
+    print(dr.mean(value))
+
+    np_value = value.numpy()
+    np_red = np.array([1, 0, 0])
+    np_blue = np.array([0, 0, 1])
+    np_color = np.where(np_value > 0, np_red, np_blue)
+    color = mi.TensorXf(np_color)
+
+    params['medium1.emission.data'] = type(params['medium1.emission.data'])(0, shape=params['medium1.emission.data'].shape)
+    params['medium1.sigma_t.data'] = type(params['medium1.sigma_t.data'])(dr.abs(value)) #(0, shape=params['medium1.sigma_t.data'].shape)
+    params['medium1.albedo.data'] = type(params['medium1.albedo.data'])(1.0, shape=params['medium1.albedo.data'].shape)
+    params.update()
+
+    preview_spp = opt_config.preview_spp or opt_config.spp
+
+    for s in scene_config.preview_sensors:
+        fname = join(output_dir, f'dgrad.exr')
+        image = mi.render(scene, integrator=integrator, sensor=s,
+                          seed=1234, spp=preview_spp,)
+        mi.Bitmap(image).write(fname)
+
+
+
+
+    # ------
+
+    print(f'[✔︎] Optimization complete: {opt_config.name}\n')
+
+    return scene, params
