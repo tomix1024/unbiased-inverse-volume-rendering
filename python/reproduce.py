@@ -9,8 +9,6 @@ from copy import deepcopy
 import os
 from os.path import join
 
-from pyrsistent import get_in
-
 import drjit as dr
 import mitsuba as mi
 from tqdm import tqdm
