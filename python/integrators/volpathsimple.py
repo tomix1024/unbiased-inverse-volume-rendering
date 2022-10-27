@@ -55,6 +55,7 @@ class VolpathSimpleIntegrator(mi.ad.integrators.common.RBIntegrator):
         result = mi.Spectrum(0. if primal else state_in)
         throughput = mi.Spectrum(1.0)
         medium = get_single_medium(scene)
+        medium = mi.MediumPtr(medium)
         channel = 0
 
         # --- Recursive calls to `sample`: restore state
@@ -465,9 +466,9 @@ class VolpathSimpleIntegrator(mi.ad.integrators.common.RBIntegrator):
         while loop(active):
             # TODO: support majorant supergrid in-line to avoid restarting DDA traversal each time
             # Handle medium interactions / transmittance
+            mei = medium.sample_interaction(ray, sampler.next_1d(active), channel, active)
             with dr.resume_grad(when=adjoint is not None):
-                mei = medium.sample_interaction(
-                    ray, sampler.next_1d(active), channel, active)
+                mei.sigma_s, mei.sigma_n, mei.sigma_t = medium.get_scattering_coefficients(mei, mei.is_valid())
                 # Ratio tracking for transmittance estimation:
                 # update throughput estimate with probability of sampling a null-scattering event.
                 tr_contribution = dr.select(
