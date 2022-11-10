@@ -498,6 +498,9 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             has_medium_trans = active_surface & si.is_medium_transition()
             medium[has_medium_trans] = si.target_medium(ray.d)
 
+            # Continue tracing only if we encountered a surface
+            active &= active_surface
+
         # TODO handle derivatives wrt. transmittance and other quantities!!
 
         return transmittance
@@ -581,6 +584,9 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             # If a medium transition is taking place: Update the medium pointer
             has_medium_trans = active_surface & si.is_medium_transition()
             medium[has_medium_trans] = si.target_medium(ray.d)
+
+            # Continue tracing only if we encountered a surface
+            active &= active_surface
 
     def backpropagate_transmittance(self, ray, medium, alt_sampler, active, adj_weight, n_samples=4):
         mei = dr.zeros(mi.MediumInteraction3f, dr.width(ray))
