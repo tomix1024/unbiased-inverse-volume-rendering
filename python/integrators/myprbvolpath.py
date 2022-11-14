@@ -384,70 +384,15 @@ class MyPRBVolpathIntegrator(RBIntegrator):
 
         The given ray's `maxt` value must correspond to the closest surface
         interaction (e.g. medium bounding box) in the direction of the ray.
-
-        Implementation from "Unbiased Inverse Volume Rendering".
         """
-        # TODO: could make this faster for the homogeneous special case
-        # TODO: could make this faster when there's a majorant supergrid
-        #       by performing both DDA and "real interaction" sampling in
-        #       the same loop.
-        # We will keep updating the origin of the ray during traversal.
-        running_ray = dr.detach(type(ray)(ray))
-        # So we also keep track of the offset w.r.t. the original ray's origin.
-        running_t = mi.Float(0.)
 
-        weight = mi.Spectrum(1.) # only changes for spectrally varying media!
-        mei = dr.zeros(mi.MediumInteraction3f, dr.width(ray))
-        mei.t = dr.select(active, dr.nan, dr.inf)
-        si = dr.zeros(mi.SurfaceInteraction3f, dr.width(ray))
-        si.t = ray.maxt
+        # Sample the interaction...
+        mei, weight, pcg32_state = medium.sample_interaction_real(ray, sampler.get_pcg32_state(), channel, active)
+        sampler.set_pcg32_state(pcg32_state, active)
 
-        active_loop = mi.Mask(active)
-        loop = mi.Loop("medium_sample_interaction_real", lambda: (
-            active_loop, mei, running_ray, running_t, sampler))
-        while loop(active_loop):
-            mei_next = medium.sample_interaction(ray, sampler.next_1d(active_loop),
-                                                 channel, active_loop)
-            mei[active_loop] = mei_next
-            mei.t[active_loop] = mei.t + running_t
-
-            # TODO only relevant for spectrally varying media, otherwise trivially 1!
-            # Multiply weight by Tr(spectral) / Tr(hero_wavelen)
-            tr_weight = dr.exp(-mei_next.t * (mei_next.combined_extinction - mei_next.combined_extinction[channel]))
-            weight[active_loop] *= tr_weight
-
-            # Binary decision: null scattering?
-            majorant = mei_next.combined_extinction[channel]
-            scatter_prob = dr.select(dr.neq(majorant, 0), mei_next.sigma_t[channel] / majorant, 0)
-
-            # Some lanes escaped the medium. Others will continue sampling
-            # until they find a real interaction.
-            active_loop &= mei_next.is_valid()
-            did_null_scatter = active_loop & (sampler.next_1d(active_loop) >= scatter_prob)
-
-            # TODO only relevant for spectrally varying media, otherwise trivially 1!
-            # In current implementation
-            # Multiply remaining scatter coeff / sampling probability for events
-            #active_coeff = dr.select(did_null_scatter, mei_next.sigma_n, mei_next.sigma_t)
-            #weight[active_loop] *= active_coeff / dr.detach(active_coeff[channel])
-            # NOTE: only do this for sigma_n. sigma_t is handled outside of this loop for differentiation reasons!
-            weight[did_null_scatter] *= mei_next.sigma_n / mei_next.sigma_n[channel]
-
-            # Only continue for null-scattering interactions
-            active_loop &= did_null_scatter
-            # Update ray to only sample points further than the
-            # current null interaction.
-            next_t = dr.detach(mei_next.t)
-            running_ray.o[active_loop] = running_ray.o + next_t * running_ray.d
-            running_ray.maxt[active_loop] = running_ray.maxt - next_t
-            running_t[active_loop] = running_t + next_t
-
-
-        did_sample = active & mei.is_valid()
-        mei.p = dr.select(did_sample, ray(mei.t), dr.nan)
-        mei.mint = mi.Float(dr.nan)  # Value was probably wrong, so we make sure it's unused
+        # Get scattering coefficients with attached gradients.
         with dr.resume_grad(when=not is_primal):
-            mei.sigma_s, mei.sigma_n, mei.sigma_t = medium.get_scattering_coefficients(mei, did_sample)
+            mei.sigma_s, mei.sigma_n, mei.sigma_t = medium.get_scattering_coefficients(mei, mei.is_valid())
 
         return mei, weight
 
@@ -515,40 +460,12 @@ class MyPRBVolpathIntegrator(RBIntegrator):
 
         active = mi.Mask(active)
         active &= dr.neq(medium, None)
-        ray = type(ray)(ray) # clone
 
         transmittance = mi.Spectrum(1.0)
 
-        """
-            # Special case for homogeneous media: directly advance to the next surface / end of the segment
-            if self.nee_handle_homogeneous:
-                active_homogeneous = active_medium & medium.is_homogeneous()
-                mei.t[active_homogeneous] = dr.minimum(remaining_dist, si.t)
-                tr_multiplier[active_homogeneous] = medium.eval_tr_and_pdf(mei, si, active_homogeneous)[0]
-                mei.t[active_homogeneous] = dr.inf
-        """
-
-        # --- Estimate transmittance with Ratio Tracking
-        # Simplified assuming that we start from within a medium, there's a single
-        # medium in the scene and no surfaces.
-        loop = mi.Loop("VolpathSimpleNEELoop", lambda: (active, ray, transmittance, sampler))
-        while loop(active):
-            mei = medium.sample_interaction(ray, sampler.next_1d(active), channel, active)
-            # If interaction falls out of bounds, we are finished!
-            active &= mei.is_valid()
-
-            # Ratio tracking for transmittance estimation:
-            # update throughput estimate with probability of sampling a null-scattering event.
-            tr_contribution = mei.sigma_n / mei.combined_extinction
-
-            # Apply effect of this interaction
-            transmittance[active] *= tr_contribution
-            # Adopt newly sampled position in the medium
-            ray.o[active] = mei.p
-            ray.maxt[active] = ray.maxt - mei.t
-
-            # Continue walking through medium
-            active &= dr.any(dr.neq(transmittance, 0.0))
+        weight, pcg32_state = medium.estimate_transmittance(ray, sampler.get_pcg32_state(), channel, active)
+        sampler.set_pcg32_state(pcg32_state, active)
+        transmittance[active] = weight
 
         return transmittance
 
