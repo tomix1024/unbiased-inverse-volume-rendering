@@ -428,8 +428,8 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             # TODO only relevant for spectrally varying media, otherwise trivially 1!
             # In current implementation
             # Multiply remaining scatter coeff / sampling probability for events
-            active_coeff = dr.select(did_null_scatter, mei_next.sigma_n, mei_next.sigma_t)
-            weight[active_loop] *= active_coeff / dr.detach(active_coeff[channel])
+            #active_coeff = dr.select(did_null_scatter, mei_next.sigma_n, mei_next.sigma_t)
+            #weight[active_loop] *= active_coeff / dr.detach(active_coeff[channel])
             # NOTE: only do this for sigma_n. sigma_t is handled outside of this loop for differentiation reasons!
             weight[did_null_scatter] *= mei_next.sigma_n / mei_next.sigma_n[channel]
 
