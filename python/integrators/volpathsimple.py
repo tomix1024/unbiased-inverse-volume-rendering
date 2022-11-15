@@ -550,7 +550,7 @@ class VolpathSimpleIntegrator(mi.ad.integrators.common.RBIntegrator):
         # With DRT, the sampling probability is T(t').
         mei_sub, drt_weight, pcg32_state = medium.sample_interaction_drt(
             sub_ray, alt_sampler.get_pcg32_state(), channel, active)
-        alt_sampler.set_pcg32_state(pcg32_state)
+        alt_sampler.set_pcg32_state(pcg32_state, active)
         with dr.resume_grad():
             mei_sub.sigma_s, mei_sub.sigma_n, mei_sub.sigma_t = \
                 medium.get_scattering_coefficients(mei_sub, active);
