@@ -120,6 +120,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
         throughput = mi.Spectrum(1)                   # Path throughput weight
         η = mi.Float(1)                               # Index of refraction
         active = mi.Bool(active)
+        escaped = mi.Bool(False)
 
         si = dr.zeros(mi.SurfaceInteraction3f)
         needs_intersection = mi.Bool(True)
@@ -143,7 +144,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
         alt_sampler = self.create_alt_sampler(sampler, is_primal)
 
         loop = mi.Loop(name=f"Path Replay Backpropagation ({mode.name})",
-                    state=lambda: (sampler, alt_sampler, active, depth, ray, medium, si,
+                    state=lambda: (sampler, alt_sampler, active, escaped, depth, ray, medium, si,
                                    throughput, Lacc, needs_intersection,
                                    last_scatter_event, specular_chain, η,
                                    last_scatter_direction_pdf, valid_ray))
@@ -166,6 +167,8 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             mei, mei_weight = self.sample_real_interaction(medium, ray, sampler, channel, active_medium, is_primal)
             active_scatter = active_medium & mei.is_valid()
             active_surface = active & si.is_valid() & ~active_scatter
+            # Detect rays escaped to environment emitter... (if present)
+            escaped |= active & (~active_surface) & (~active_scatter)
 
             # --- Scattering-only gradients (albedo, sigma_t)
             with dr.resume_grad(when=not is_primal):
@@ -216,8 +219,8 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             emitter[~active_e] = dr.zeros(mi.EmitterPtr)
 
             # Get the PDF of sampling this emitter using next event estimation
-            ds = mi.DirectionSample3f(scene, si, last_scatter_event)
             if self.use_nee:
+                ds = mi.DirectionSample3f(scene, si, last_scatter_event)
                 emitter_pdf = dr.select(specular_chain, 0.0, scene.pdf_emitter_direction(last_scatter_event, ds, active_e))
             else:
                 emitter_pdf = 0.0
@@ -286,7 +289,8 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             # ---- Advance ray depth ----
 
             # Don't estimate further lighting if we exceeded number of bounces
-            active &= depth < self.max_depth
+            if self.max_depth >= 0:
+                active &= depth < self.max_depth
             active_scatter &= active
             active_surface &= active
 
@@ -356,6 +360,37 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             # specular_chain[act_null_scatter] = Unchanged
 
             active &= (active_surface | active_scatter)
+
+
+        # --- Envmap contribution
+        if is_primal:
+            # TODO yes, we do need to consider MIS here.
+            # The environment could be/will have been importance sampled via NEE at the previous interaction!
+            # Also need to take transmittance into account from the previous surface interaction!!!!
+            emitter = scene.environment()
+            if emitter is not None:
+                # All escaped rays can now query the envmap
+                active_e = escaped & ~((depth <= 0) & self.hide_emitters)
+                si.p[escaped] = ray.o
+                si.wi[escaped] = -ray.d
+
+                if self.use_nee:
+                    assert last_scatter_event is not None
+                    assert last_scatter_direction_pdf is not None
+                    #ds = mi.DirectionSample3f(scene, si, last_scatter_event)
+                    ds = dr.zeros(mi.DirectionSample3f)
+                    ds.d = ray.d
+                    emitter_pdf = emitter.pdf_direction(last_scatter_event, ds, active_e)
+                    emitter_pdf = dr.select(specular_chain, 0.0, emitter_pdf)
+                else:
+                    emitter_pdf = 0.0
+
+                # TODO: envmap gradients
+                contrib = emitter.eval(si, active_e)
+                Lacc[active_e] += throughput * contrib * mis_weight(last_scatter_direction_pdf, emitter_pdf)
+                del emitter, active_e, contrib
+
+
 
         # Output radiance is accumulated radiance
         L = Lacc
