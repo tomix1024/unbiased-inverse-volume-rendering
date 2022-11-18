@@ -205,7 +205,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
                 Lo = Lfinal - Lacc # compute remaining radiance passing through this event
                 δLo = δL
                 adj_weight = δL * Lo
-                self.backpropagate_transmittance(ray, medium, alt_sampler, active, adj_weight)
+                self.backpropagate_transmittance(ray, medium, alt_sampler, active_medium & ~escaped, adj_weight)
                 del adj_weight, Lo, δLo
             # ----------
 
