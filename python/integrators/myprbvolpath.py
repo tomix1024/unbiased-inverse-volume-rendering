@@ -78,6 +78,9 @@ class MyPRBVolpathIntegrator(RBIntegrator):
         self.handle_null_scattering = False
         self.is_prepared = False
 
+        self.use_drt = True
+        self.use_drt_mis = True
+
     def prepare_scene(self, scene):
         if self.is_prepared:
             return
@@ -101,6 +104,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
                δL: Optional[mi.Spectrum],
                state_in: Optional[mi.Spectrum],
                active: mi.Bool,
+               path_state: Optional[Dict] = None,
                **kwargs # Absorbs unused arguments
     ) -> Tuple[mi.Spectrum,
                mi.Bool, mi.Spectrum]:
@@ -134,6 +138,16 @@ class MyPRBVolpathIntegrator(RBIntegrator):
         depth = mi.UInt32(0)
         valid_ray = mi.Bool(False)
         specular_chain = mi.Bool(True)
+
+        # This is a recursive call...
+        if path_state is not None:
+            depth[active] = path_state['depth']
+            last_scatter_event[active] = path_state['last_scatter_event']
+            last_scatter_direction_pdf[active] = path_state['last_scatter_direction_pdf']
+            medium[active] = path_state['medium']
+            channel = path_state['channel'] # This is a host variable
+            specular_chain = mi.Bool(False) # TODO get from path state...
+
 
         # TODO reenable spectral sampling!
         #if mi.is_rgb: # Sample a color channel to sample free-flight distances
@@ -169,25 +183,36 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             active_surface = active & si.is_valid() & ~active_scatter
             # Detect rays escaped to environment emitter... (if present)
             escaped |= active & (~active_surface) & (~active_scatter)
-            ray.maxt[active_scatter] = mei.t
 
             # --- Scattering-only gradients (albedo, sigma_t)
+            # NOTE: DRT requires the "long" ray used for generating the medium scattering event if present.
             with dr.resume_grad(when=not is_primal):
                 sigma_t = dr.select(active_scatter, mei.sigma_t, 1.0)
                 albedo = dr.select(active_scatter, medium.get_albedo(mei, active_scatter), 1.0)
                 scatter_weight = albedo * sigma_t / dr.detach(sigma_t[channel])
             if not is_primal:
-                # TODO implement DRT
-                # TODO verify value of throughput! for DRT this is maybe important, for "regular" differentiation this does not matter.
-                # TODO Where did the problematic 1/sigma_t disappear?! it's hidden in the nominator of the scatter_weight!
-                Lo = Lfinal - Lacc # compute remaining radiance passing through this event
-                Li = Lo / dr.maximum(1e-8, albedo*sigma_t)
-                with dr.resume_grad(when=not is_primal):
-                    Lo = albedo*sigma_t * Li
-                    δLo = δL
-                    dr.backward_from(δLo * Lo)
-                del Li, Lo, δLo
+                if self.use_drt:
+                    # TODO verify value of throughput! for DRT this is maybe important, for "regular" differentiation this does not matter.
+                    adjoint = (δL * throughput)
+                    self.backpropagate_scattering_drt(scene, medium, alt_sampler, ray, depth, channel, adjoint, active)
+                    del adjoint
+                if (not self.use_drt) or self.use_drt_mis:
+                    drt_mis_weight = 1.0
+                    if self.use_drt and self.use_drt_mis:
+                        # Note: MIS weight hardcoded for the power heuristic
+                        s2 = dr.sqr(sigma_t)
+                        drt_mis_weight = s2 / (1 + s2)
+                    Lo = Lfinal - Lacc # compute remaining radiance passing through this event
+                    Li = Lo / dr.maximum(1e-8, albedo*sigma_t)
+                    with dr.resume_grad(when=not is_primal):
+                        Lo = albedo*sigma_t * Li
+                        δLo = δL
+                        dr.backward_from(drt_mis_weight * δLo * Lo)
+                    del Li, Lo, δLo
             # ----------
+
+            # "Terminate"/Shorten the ray at the medium interaction AFTER backpropagating scattering gradients...
+            ray.maxt[active_scatter] = mei.t
 
             # Account for albedo on subsequent bounces (no-op if there was no scattering)
             throughput[active_medium] *= mei_weight * scatter_weight
@@ -244,7 +269,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             bsdf = si.bsdf(ray)
             bsdf[~active_surface] = dr.zeros(mi.BSDFPtr)
 
-            phase_ctx = mi.PhaseFunctionContext(sampler)
+            phase_ctx = mi.PhaseFunctionContext(None)
             phase = mei.medium.phase_function()
             phase[~active_scatter] = dr.zeros(mi.PhaseFunctionPtr)
 
@@ -274,14 +299,13 @@ class MyPRBVolpathIntegrator(RBIntegrator):
                     contrib = throughput * bsdf_or_phase_val * mis_weight(ds.pdf, bsdf_or_phase_directional_pdf) * emitted
                 Lacc[active_e] += contrib
                 if not is_primal:
-                    # TODO only backprop if there is something to backpropagate to, i.e. there is a medium?
                     with dr.resume_grad():
                         Lo = contrib
                         δLo = δL
                         adj_weight = δLo * Lo
                         if dr.grad_enabled(contrib):
                             dr.backward_from(adj_weight)
-                        backprop_active = active_e & dr.any(dr.neq(adj_weight, 0.0))
+                    backprop_active = active_e & dr.any(dr.neq(adj_weight, 0.0))
                     self.backpropagate_transmittance_null_tr(ref_interaction, ds, scene, alt_sampler, medium, backprop_active, dr.detach(adj_weight))
 
             # ---- End emitter sampling ----
@@ -432,6 +456,103 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             mei.sigma_s, mei.sigma_n, mei.sigma_t = medium.get_scattering_coefficients(mei, mei.is_valid())
 
         return mei, weight
+
+
+    def backpropagate_scattering_drt(self, scene, medium, alt_sampler, ray, depth, channel,
+                                     adjoint, active):
+        """
+        Estimate in-scattering gradients with Differential Delta Tracking.
+        """
+        assert self.use_drt
+
+        # TODO ray.maxt was set to FLOAT_MAX if no surface interaction was present...
+        # currently ray.maxt is limited by the surface OR medium interaction position
+        # does it make sense to sample a positon AFTER the interaction of interest???
+        # NOTE: we want to use the TMAX that was used as a limit for generating the medium interaction, whether it was found or not!
+
+        # With DRT, the sampling probability is T(t').
+        pcg32_state = alt_sampler.get_pcg32_state()
+        mei, drt_weight, pcg32_state = medium.sample_interaction_drt(ray, pcg32_state, channel, active)
+        alt_sampler.set_pcg32_state(pcg32_state, active)
+        with dr.resume_grad():
+            mei.sigma_s, mei.sigma_n, mei.sigma_t = medium.get_scattering_coefficients(mei, active)
+        mei.combined_extinction = medium.get_majorant(mei, active)
+
+        # This should always succeed.
+        active = active & mei.is_valid()
+
+        # --- Estimate incident radiance
+        # Unfortunately, this is a new free-flight distance t',
+        # different from the main path. Therefore the value Li
+        # provided by path replay is not valid. We have to
+        # estimate Li again, which is costly.
+        with dr.suspend_grad():
+            # TODO advance ray to mei?
+            drt_Li = self.sample_recursive(scene, alt_sampler, mei, channel, depth, active)
+        # ----------
+
+        if self.use_drt_mis:
+            # Note: MIS weight hardcoded for the power heuristic
+            drt_mis_weight = 1 / (1 + dr.sqr(mei.sigma_t))
+        else:
+            drt_mis_weight = 1.0
+
+        with dr.resume_grad():
+            albedo = medium.get_albedo(mei, active)
+            to_backward = dr.select(active, mei.sigma_t * albedo, 0.)
+            dr.backward_from(drt_mis_weight * drt_weight * adjoint * to_backward * drt_Li)
+
+
+
+    def sample_recursive(self, scene, alt_sampler, mei, channel, depth, active):
+        """
+        Trace a detached recursive ray to estimate Li incident to the current medium
+        interaction.
+        """
+        medium = mei.medium
+        result = dr.zeros(mi.Spectrum)
+        phase_ctx = mi.PhaseFunctionContext(alt_sampler)
+        phase = medium.phase_function()
+
+        # 1. Emitter sampling (including the MIS weight)
+        if self.use_nee:
+            sample_emitters = medium.use_emitter_sampling()
+            active_e = active & sample_emitters & ~mi.has_flag(phase.flags(), mi.PhaseFunctionFlags.Delta)
+
+            # Query the BSDF for that emitter-sampled direction
+            emitted, ds = self.sample_emitter(mei, scene, alt_sampler, medium, channel, active_e)
+            phase_val = phase.eval(phase_ctx, mei, ds.d, active_e)
+            phase_directional_pdf = dr.select(ds.delta, 0.0, dr.detach(phase_val))
+
+            contrib = phase_val * mis_weight(ds.pdf, phase_directional_pdf) * emitted
+            result[active_e] += contrib
+
+        # 2. Phase sampling (including the MIS weight)
+        # Prepare recursive ray to be traced. We can assume it's leaving
+        # from a valid medium interaction.
+        # Note: we assume perfect importance sampling of the phase function.
+        wo, phase_pdf = phase.sample(
+            phase_ctx, mei, alt_sampler.next_1d(active), alt_sampler.next_2d(active), active)
+        next_ray = mei.spawn_ray(wo)
+        next_depth = depth + 1
+        active_r = active & (next_depth < self.max_depth)
+        path_state = {
+            "depth": next_depth,
+            "last_scatter_event": mei,
+            "last_scatter_direction_pdf": phase_pdf,
+            "medium": medium,
+            "channel": channel
+        }
+        # ----------
+
+        Li, _, _ = self.sample(dr.ADMode.Primal, scene, alt_sampler, next_ray, δL=None, state_in=None, active=active_r,
+                               path_state=path_state)
+        result[active_r] += Li
+
+        return result & active
+
+
+
 
     def estimate_transmittance_null_tr(self, it, ds, scene, sampler, medium, channel, active):
 
