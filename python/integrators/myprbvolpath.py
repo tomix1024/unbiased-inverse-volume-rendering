@@ -169,6 +169,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             active_surface = active & si.is_valid() & ~active_scatter
             # Detect rays escaped to environment emitter... (if present)
             escaped |= active & (~active_surface) & (~active_scatter)
+            ray.maxt[active_scatter] = mei.t
 
             # --- Scattering-only gradients (albedo, sigma_t)
             with dr.resume_grad(when=not is_primal):
