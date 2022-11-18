@@ -352,6 +352,8 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             has_medium_trans = active_surface & si.is_medium_transition()
             medium[has_medium_trans] = si.target_medium(ray.d)
 
+            # ---- End bsdf sampling ----
+
             valid_ray |= non_null_bsdf | active_scatter
 
             # specular_chain[null_bsdf] = Unchanged
