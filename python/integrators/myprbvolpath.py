@@ -263,7 +263,6 @@ class MyPRBVolpathIntegrator(RBIntegrator):
                 ref_interaction = dr.zeros(mi.Interaction3f)
                 ref_interaction[active_scatter] = mei
                 ref_interaction[active_surface] = si
-                nee_sampler = sampler if is_primal else sampler.clone()
                 # Query the BSDF for that emitter-sampled direction
                 with dr.resume_grad(when=not is_primal):
                     emitted, ds = self.sample_emitter(ref_interaction, scene, sampler, medium, channel, active_e)
@@ -283,7 +282,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
                         if dr.grad_enabled(contrib):
                             dr.backward_from(adj_weight)
                         backprop_active = active_e & dr.any(dr.neq(adj_weight, 0.0))
-                    self.backpropagate_transmittance_null_tr(ref_interaction, ds, scene, nee_sampler, alt_sampler, medium, backprop_active, dr.detach(adj_weight))
+                    self.backpropagate_transmittance_null_tr(ref_interaction, ds, scene, alt_sampler, medium, backprop_active, dr.detach(adj_weight))
 
             # ---- End emitter sampling ----
 
@@ -463,10 +462,6 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             # Handle medium absorbtion along the ray
             ray.maxt[active_surface] = si.t
             tr_val = self.estimate_transmittance(ray, medium, sampler, channel, active)
-            #if not is_primal:
-            #    # TODO adj. weight only available after the loop completed!
-            #    # Have to do this in a second loop (or with reservoirs)!
-            #    self.backpropagate_transmittance(ray, medium, alt_sampler, active, adj_weight)
             transmittance[active] *= tr_val
 
             # Update the ray with new origin & t parameter
@@ -507,7 +502,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
 
         return transmittance
 
-    def backpropagate_transmittance_null_tr(self, it, ds, scene, sampler, alt_sampler, medium, active, adj_weight, n_samples=4):
+    def backpropagate_transmittance_null_tr(self, it, ds, scene, alt_sampler, medium, active, adj_weight, n_samples=4):
 
         active = mi.Mask(active)
         medium = dr.select(active, medium, dr.zeros(mi.MediumPtr))
@@ -515,7 +510,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
         ray = it.spawn_ray(ds.d)
         total_dist = mi.Float(0.0)
         loop = mi.Loop(name=f"backpropagate_transmittance_null_tr",
-                       state=lambda: (sampler, active, medium, ray, total_dist))
+                       state=lambda: (alt_sampler, active, medium, ray, total_dist))
         while loop(active):
             remaining_dist = ds.dist * (1.0 - mi.math.ShadowEpsilon) - total_dist
             ray.maxt = remaining_dist
@@ -529,7 +524,7 @@ class MyPRBVolpathIntegrator(RBIntegrator):
             ray.maxt[active_surface] = si.t
             # Backpropagate transmittance along the medium segment.
             # TODO check if the medium actually exists!
-            self.backpropagate_transmittance(ray, medium, alt_sampler, active, adj_weight)
+            self.backpropagate_transmittance(ray, medium, alt_sampler, active, adj_weight, n_samples=n_samples)
 
             # Update the ray with new origin & t parameter
             ray[active_surface] = si.spawn_ray(mi.Vector3f(ray.d))
